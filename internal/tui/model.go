@@ -108,3 +108,4 @@ func listenStatusCmd(eb *events.EventBus) tea.Cmd {
 		return NodeStatusMsg(evt)
 	}
 }
+

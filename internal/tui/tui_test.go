@@ -149,3 +149,4 @@ func TestTUIViewRendering(t *testing.T) {
 		t.Errorf("rendered view missing keyboard shortcuts")
 	}
 }
+

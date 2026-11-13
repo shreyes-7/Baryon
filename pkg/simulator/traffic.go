@@ -207,3 +207,4 @@ func (s *TrafficSimulator) Stop() {
 func (s *TrafficSimulator) Stats() (sent, success, failed uint64) {
 	return s.sentRequests.Load(), s.successRequests.Load(), s.failedRequests.Load()
 }
+

@@ -105,3 +105,4 @@ func (m *Model) appendLog(entry LogEntry) {
 		m.recentLogs = append(m.recentLogs, entry)
 	}
 }
+

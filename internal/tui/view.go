@@ -188,3 +188,4 @@ func (m Model) View() string {
 	content := strings.Join(sections, "\n")
 	return boxStyle.Width(contentWidth).Render(content)
 }
+

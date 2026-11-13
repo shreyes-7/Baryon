@@ -89,3 +89,4 @@ func TestTrafficSimulatorCancellation(t *testing.T) {
 
 	// Should exit cleanly without deadlock or hanging
 }
+
