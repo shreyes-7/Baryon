@@ -105,13 +105,17 @@
 
 ---
 
-## Getting Started
+## Getting Started & Execution Guide
 
 ### Prerequisites
 
-- **Go 1.22+** (tested on Go 1.27.3 windows/amd64).
+- **Go 1.22+** (tested on Go 1.27.3 `windows/amd64` and Linux).
 
-### Running Baryon
+---
+
+### Execution Modes
+
+#### Mode 1: Interactive Real-Time Dashboard (Recommended)
 
 Launch the complete self-contained application with a single command:
 
@@ -119,64 +123,182 @@ Launch the complete self-contained application with a single command:
 go run ./cmd/proxy
 ```
 
-This will automatically:
-1. Start three dummy upstream HTTP servers on ports `8081`, `8082`, and `8083`.
-2. Initialize the consistent hash ring with 100 virtual nodes per backend.
-3. Start the reverse proxy on port `8080`.
-4. Launch the active health checker probing every 3 seconds.
-5. Launch the Bubble Tea terminal dashboard.
-6. Begin streaming 500 requests/second from the traffic simulator.
+This single command automatically orchestrates the entire system:
+1. Starts three local dummy upstream HTTP servers on ports `:8081`, `:8082`, and `:8083`.
+2. Initializes the consistent hash ring with 100 virtual node replicas per backend.
+3. Starts the HTTP reverse proxy listening on `:8080`.
+4. Spawns the active TCP health monitor probing backends every 3 seconds.
+5. Launches the interactive Bubble Tea terminal dashboard.
+6. Starts the background traffic simulator streaming 500 requests/second across 10 distinct client IPs.
 
-### Headless / CLI Mode
+---
 
-To run without the terminal dashboard (e.g. for CI pipelines or scripts):
+#### Mode 2: Compile and Run Standalone Binary
+
+You can compile a standalone executable binary without Go installed on the target host:
+
+```bash
+# On Windows (PowerShell)
+go build -o baryon.exe ./cmd/proxy
+.\baryon.exe
+
+# On Linux / macOS (Bash)
+go build -o baryon ./cmd/proxy
+./baryon
+```
+
+---
+
+#### Mode 3: Headless / Console Mode (CI & Automation)
+
+To run BARYON in server/headless mode without the Bubble Tea TUI (ideal for Docker containers, CI test pipelines, or background services):
 
 ```bash
 go run ./cmd/proxy -no-tui
 ```
 
-### Manual Request Verification
+Output is emitted to stdout/stderr with clean structured logs. Terminate at any time with `Ctrl+C`.
 
-You can verify consistent hashing and sticky routing manually using `curl`:
+---
+
+#### Mode 4: Manual API Testing (Disable Simulator)
+
+To start the load balancer without the automatic traffic simulator (allowing clean, isolated manual `curl` testing):
 
 ```bash
-# Request with Client IP 192.168.1.50 -> consistently routes to backend-2
-curl -H "X-Forwarded-For: 192.168.1.50" http://localhost:8080/
+go run ./cmd/proxy -no-sim
+```
 
-# Output:
-# {"backend":"backend-2","address":"localhost:8082","status":"ok","path":"/"}
+Or run headless without the simulator:
 
-# Request with Client IP 10.0.0.1 -> consistently routes to backend-3
-curl -H "X-Forwarded-For: 10.0.0.1" http://localhost:8080/
-
-# Output:
-# {"backend":"backend-3","address":"localhost:8083","status":"ok","path":"/"}
+```bash
+go run ./cmd/proxy -no-tui -no-sim
 ```
 
 ---
 
-## Command-Line Configuration Flags
+#### Mode 5: Custom Ports, Throughput Rates & File Logging
 
-| Flag | Default | Description |
-|---|---|---|
-| `-listen` | `:8080` | Proxy listen host and port |
-| `-rate` | `500` | Simulator target requests per second |
-| `-no-tui` | `false` | Run in headless mode without Bubble Tea TUI |
-| `-no-sim` | `false` | Disable background traffic simulator |
-| `-log-file` | `""` | Optional file destination for structured logs |
+BARYON supports flexible command-line flags:
+
+```bash
+# Listen on port 9000, generate 1000 requests/second, and write logs to baryon.log
+go run ./cmd/proxy -listen :9000 -rate 1000 -log-file baryon.log
+```
 
 ---
 
-## Testing & Benchmarks
+## Command-Line Configuration Reference
 
-### Running the Test Suite
+| Flag | Default | Description |
+|---|---|---|
+| `-listen` | `:8080` | Proxy listen host and port (e.g. `:8080` or `127.0.0.1:9090`) |
+| `-rate` | `500` | Simulator target requests per second |
+| `-no-tui` | `false` | Run in headless console mode without the Bubble Tea TUI |
+| `-no-sim` | `false` | Disable background traffic simulator on startup |
+| `-log-file` | `""` | Optional file destination for structured background logs |
+
+---
+
+## Step-by-Step Interactive Demo Walkthrough
+
+Once BARYON is running in default mode (`go run ./cmd/proxy`), follow this 4-step demonstration:
+
+1. **Observe Normal Load Balancing**:
+   - The simulator pumps ~500 req/s across 10 client IPs.
+   - All three backends display `ONLINE` with evenly distributed traffic bars (~33% share each).
+   - The Recent Routing Log shows continuous sticky client mappings.
+
+2. **Trigger Simulated Backend Failure (`K`)**:
+   - Press **`K`** on your keyboard.
+   - Backend 1 (`:8081`) immediately closes its TCP listener.
+   - Within 3 seconds, the health checker detects the failure, updates Backend 1 to **`OFFLINE`** (red), and removes it from the hash ring.
+   - Traffic automatically shifts to Backend 2 and 3 (~50% share each) with **zero 503 errors**.
+
+3. **Trigger Simulated Backend Recovery (`R`)**:
+   - Press **`R`** on your keyboard.
+   - Backend 1 rebinds its TCP listener on `:8081`.
+   - The health checker detects recovery, updates Backend 1 to **`ONLINE`** (green), and re-adds its 100 virtual nodes to the hash ring.
+   - Traffic dynamically rebalances across all 3 nodes (~33% share each).
+
+4. **Graceful Shutdown (`Q`)**:
+   - Press **`Q`** or **`Ctrl+C`**.
+   - The simulator cancels workers, health checks halt, the reverse proxy finishes in-flight requests, and dummy servers shut down cleanly.
+
+---
+
+## Verification Scripts
+
+### PowerShell Verification Script (Windows)
+
+Save as `test_routing.ps1` or run directly in PowerShell while BARYON is running:
+
+```powershell
+Write-Host "=== BARYON Sticky Routing Verification ===" -ForegroundColor Cyan
+
+$clients = @(
+    @{ IP = "192.168.1.50"; Label = "Client A" },
+    @{ IP = "10.0.0.1";     Label = "Client B" },
+    @{ IP = "172.16.0.100"; Label = "Client C" }
+)
+
+foreach ($c in $clients) {
+    Write-Host "`nTesting $($c.Label) (IP: $($c.IP))..." -ForegroundColor Yellow
+    for ($i = 1; $i -le 3; $i++) {
+        $resp = Invoke-RestMethod -Uri "http://localhost:8080/" -Headers @{ "X-Forwarded-For" = $c.IP }
+        Write-Host "  Request $i -> Handled by: $($resp.backend) ($($resp.address))" -ForegroundColor Green
+    }
+}
+```
+
+### Bash Verification Script (Linux / macOS)
 
 ```bash
-# Run all unit and integration tests
+#!/usr/bin/env bash
+echo "=== BARYON Sticky Routing Verification ==="
+
+clients=("192.168.1.50" "10.0.0.1" "172.16.0.100")
+
+for ip in "${clients[@]}"; do
+    echo -e "\nTesting Client IP: $ip..."
+    for i in {1..3}; do
+        resp=$(curl -s -H "X-Forwarded-For: $ip" http://localhost:8080/)
+        echo "  Request $i -> $resp"
+    done
+done
+```
+
+---
+
+## Testing & Performance Benchmarks
+
+### Running the Full Test Suite
+
+```bash
+# Run all unit and integration tests with verbose output
 go test -v ./...
 
 # Static analysis and vet
 go vet ./...
+```
+
+### Running Targeted Package Tests
+
+```bash
+# Test Consistent Hash Ring (distribution, stickiness, minimal remapping)
+go test -v ./internal/hashing/...
+
+# Test HTTP Reverse Proxy and Client IP Extraction
+go test -v ./internal/proxy/...
+
+# Test Active Health Checker and Auto-Recovery
+go test -v ./internal/health/...
+
+# Test Terminal Dashboard Model and View
+go test -v ./internal/tui/...
+
+# Test Traffic Simulator Engine
+go test -v ./pkg/simulator/...
 ```
 
 ### Measured Performance Benchmarks
@@ -249,9 +371,7 @@ baryon/
 │       └── traffic_test.go      # Simulator rate & cancellation tests
 ├── go.mod
 ├── go.sum
-├── README.md
-├── TASKS.md                     # Roadmap and progress tracker
-└── PROJECT_CONTEXT.md           # Engineering specification
+└── README.md
 ```
 
 ---
