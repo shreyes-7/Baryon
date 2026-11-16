@@ -264,3 +264,61 @@ func BenchmarkHashRingGetNode(b *testing.B) {
 		}
 	})
 }
+
+
+func TestBoundedLoadRouting(t *testing.T) {
+	ring := NewHashRing(100)
+	b1 := newTestBackend("backend-1", "http://localhost:8081")
+	b2 := newTestBackend("backend-2", "http://localhost:8082")
+	b3 := newTestBackend("backend-3", "http://localhost:8083")
+
+	_ = ring.AddNode(b1)
+	_ = ring.AddNode(b2)
+	_ = ring.AddNode(b3)
+
+	key := "hot-client-192.168.1.50"
+	primaryNode := ring.GetNode(key)
+	if primaryNode == nil {
+		t.Fatalf("expected primary node for key")
+	}
+
+	// 1. When primary is not overloaded, Bounded Load returns the primary node
+	selected := ring.GetNodeWithBoundedLoad(key, func(b *proxy.Backend) bool {
+		return false
+	})
+	if selected.Name != primaryNode.Name {
+		t.Errorf("expected primary node %s, got %s", primaryNode.Name, selected.Name)
+	}
+
+	// 2. When primary is overloaded, Bounded Load spills to the next clockwise node
+	selected = ring.GetNodeWithBoundedLoad(key, func(b *proxy.Backend) bool {
+		return b.Name == primaryNode.Name // primary is overloaded
+	})
+	if selected.Name == primaryNode.Name {
+		t.Errorf("expected spillover away from overloaded primary node %s", primaryNode.Name)
+	}
+
+	// 3. When primary and second candidate are overloaded, spills to the third
+	secondNode := selected
+	selected = ring.GetNodeWithBoundedLoad(key, func(b *proxy.Backend) bool {
+		return b.Name == primaryNode.Name || b.Name == secondNode.Name
+	})
+	if selected.Name == primaryNode.Name || selected.Name == secondNode.Name {
+		t.Errorf("expected spillover to third node, got %s", selected.Name)
+	}
+
+	// 4. When all nodes are overloaded, falls back to the least loaded node
+	b1.IncActive()
+	b1.IncActive() // active = 2
+	b2.IncActive() // active = 1
+	b3.IncActive()
+	b3.IncActive()
+	b3.IncActive() // active = 3
+
+	selected = ring.GetNodeWithBoundedLoad(key, func(b *proxy.Backend) bool {
+		return true // all overloaded
+	})
+	if selected.Name != "backend-2" {
+		t.Errorf("expected fallback to least-loaded backend-2 (active=1), got %s", selected.Name)
+	}
+}

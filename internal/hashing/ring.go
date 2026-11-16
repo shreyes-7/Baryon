@@ -121,10 +121,20 @@ func (r *HashRing) RemoveNode(name string) error {
 	return nil
 }
 
+// LoadEvaluator is a function that checks whether a backend is currently considered overloaded.
+type LoadEvaluator = func(backend *proxy.Backend) bool
+
 // GetNode looks up the assigned backend for the given routing key (e.g. client IP).
 // Returns nil if the hash ring is empty.
 // Thread-safe; acquires a read lock only for the duration of the lookup without network I/O.
 func (r *HashRing) GetNode(key string) *proxy.Backend {
+	return r.GetNodeWithBoundedLoad(key, nil)
+}
+
+// GetNodeWithBoundedLoad looks up the assigned backend for the given routing key,
+// skipping overloaded backends in clockwise ring order (Consistent Hashing with Bounded Loads).
+// If all backends are overloaded or isOverloaded is nil, it falls back to the least-loaded backend.
+func (r *HashRing) GetNodeWithBoundedLoad(key string, isOverloaded LoadEvaluator) *proxy.Backend {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -144,7 +154,50 @@ func (r *HashRing) GetNode(key string) *proxy.Backend {
 		idx = 0
 	}
 
-	return r.hashMap[r.hashKeys[idx]]
+	primary := r.hashMap[r.hashKeys[idx]]
+	if isOverloaded == nil || len(r.nodes) <= 1 {
+		return primary
+	}
+
+	// Fast path: if primary candidate is not overloaded, return it directly
+	if !isOverloaded(primary) {
+		return primary
+	}
+
+	// Bounded-load fallthrough: traverse clockwise until an underloaded backend is found
+	visited := make(map[string]bool, len(r.nodes))
+	visited[primary.Name] = true
+
+	var leastLoaded *proxy.Backend = primary
+	_, minActive := primary.GetStats()
+
+	totalKeys := len(r.hashKeys)
+	for step := 1; step < totalKeys; step++ {
+		pos := (idx + step) % totalKeys
+		candidate := r.hashMap[r.hashKeys[pos]]
+		if visited[candidate.Name] {
+			continue
+		}
+		visited[candidate.Name] = true
+
+		if !isOverloaded(candidate) {
+			return candidate
+		}
+
+		_, active := candidate.GetStats()
+		if active < minActive {
+			minActive = active
+			leastLoaded = candidate
+		}
+
+		// Stop once all distinct backends have been evaluated
+		if len(visited) == len(r.nodes) {
+			break
+		}
+	}
+
+	// If all backends are currently overloaded, fall back to the least-loaded node
+	return leastLoaded
 }
 
 // HasNode returns true if a backend with the given name is currently registered.

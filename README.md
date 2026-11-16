@@ -55,6 +55,8 @@
 
 - **Layer 7 HTTP Reverse Proxying**: Built upon Go's production-grade `net/http/httputil.ReverseProxy`, preserving request methods, paths, query strings, and custom headers.
 - **Consistent Hashing Engine**: Implements a consistent hash ring using `hash/crc32.ChecksumIEEE` with 100 virtual node replicas per backend, deterministic positioning, and collision resolution.
+- **Consistent Hashing with Bounded Loads (Mirrokni Algorithm)**: Dynamically caps maximum load per backend to $(1 + \epsilon) \times \text{average load}$ (configurable, default $1.25\times$). When a backend or its neighbor crashes, traffic assigned to heavy "hot IPs" automatically overflows clockwise to the next underloaded node on the ring instead of crushing the immediate neighbor node (preventing cascading outages).
+- **Per-IP Token Bucket Rate Limiting**: Built-in thread-safe rate limiter per client IP with burst handling and automatic lazy eviction of inactive client state, returning HTTP 429 (Too Many Requests) when abuse is detected.
 - **Sticky Client Routing**: Automatically hashes normalized client IPs (from direct socket or trusted `X-Forwarded-For` chains). Requests from identical client IPs consistently route to the identical backend while ring membership remains stable.
 - **Minimal Remapping**: When cluster membership changes, only keys mapped to the affected node move; all unaffected backends retain 100% of their existing key associations.
 - **Active TCP Health Monitoring**: Background health checker probes all configured backends every 3 seconds (2s dial timeout) outside of ring locks, automatically pruning dead nodes and restoring recovered backends.
@@ -62,6 +64,30 @@
 - **Real-Time Terminal Dashboard**: Interactive TUI powered by `github.com/charmbracelet/bubbletea` and `github.com/charmbracelet/lipgloss`, featuring live traffic distribution bars, measured requests per second (RPS), backend health tags, and latest routing events.
 - **Traffic Simulator**: Self-contained load generator driving 500 requests per second across 10 deterministic client IPs to demonstrate live load balancing.
 - **Interactive Failure & Recovery Simulation**: Dedicated keyboard shortcuts (`K` to stop Backend 1, `R` to restart Backend 1) allow live demonstration of fault detection, automatic ring pruning, traffic rebalancing, and node resurrection.
+
+---
+
+## Deep Dive: Solving Cascading Neighbor Overload & Hot IPs
+
+### The Classical Consistent Hashing Failure Mode
+In standard consistent hashing, when node $N_1$ fails, all keys previously mapped to $N_1$ spill over clockwise to the next node $N_2$.
+If the traffic on $N_1$ contained a heavy **"Hot IP"** (e.g. an aggressive crawler, large enterprise NAT, API integration, or DoS flood), $N_2$ receives 100% of its normal traffic **plus** the heavy hot IP load. If $N_2$ gets saturated and crashes, the combined traffic spills to $N_3$, causing a catastrophic **cascading domino failure** across the entire cluster.
+
+### BARYON's Defense: Consistent Hashing with Bounded Loads
+BARYON implements Google's **Consistent Hashing with Bounded Loads** (Mirrokni et al.) coupled with **Per-IP Token Bucket Rate Limiting**:
+
+1. **Dynamic Capacity Ceiling ($C$)**:
+   The proxy continuously tracks active in-flight requests across all backends. Each backend is assigned a maximum capacity threshold:
+   $$C = \left\lceil (1 + \epsilon) \cdot \frac{\text{Total Active Requests}}{\text{Number of Active Healthy Backends}} \right\rceil$$
+   *(where $\epsilon$ is the configurable `bounded_load_factor`, default $1.25$ or $125\%$ of average).*
+
+2. **Clockwise Spillover Walk**:
+   When routing a client IP, BARYON identifies the primary hash node on the ring. If that node's active load exceeds $C$, BARYON walks clockwise to find the next underloaded node.
+   - If a heavy hot IP was pushing $N_2$ over its capacity ceiling during $N_1$'s failure, subsequent requests for that hot IP (or other keys) automatically spill past $N_2$ to underloaded backends ($N_3$), balancing the cluster rather than crashing the neighbor.
+   - If all backends are saturated under extreme surge, BARYON deterministically routes to the **least-loaded** backend.
+
+3. **Per-IP Token Bucket Rate Limiter**:
+   To prevent malicious single-client DoS floods from exhausting the entire cluster, an in-memory token bucket limiter throttles abusive IPs (default 2000 req/s, burst 500) and immediately returns **HTTP 429 Too Many Requests**, protecting upstream compute and connection pools.
 
 ---
 
@@ -197,6 +223,10 @@ go run ./cmd/proxy -listen :9000 -rate 1000 -log-file baryon.log
 | `-no-tui` | `false` | Run in headless console mode without the Bubble Tea TUI |
 | `-no-sim` | `false` | Disable background traffic simulator on startup |
 | `-log-file` | `""` | Optional file destination for structured background logs |
+| `-bounded-factor` | `1.25` | Bounded load factor ($\epsilon = 0.25$, max load = $1.25 \times \text{average}$) |
+| `-max-active` | `0` | Hard cap on active connections per backend (0 for dynamic average $\times$ factor) |
+| `-rate-limit` | `2000` | Max requests/sec allowed per client IP before returning HTTP 429 (0 to disable) |
+| `-rate-burst` | `500` | Token bucket burst capacity per client IP |
 
 ---
 
@@ -356,6 +386,8 @@ baryon/
 │   │   ├── handler_test.go      # Proxy integration & end-to-end benchmarks
 │   │   ├── ip.go                # Safe client IP & X-Forwarded-For extraction
 │   │   ├── ip_test.go           # IP parsing unit tests
+│   │   ├── ratelimit.go         # Per-IP token bucket rate limiter & auto-cleanup
+│   │   ├── ratelimit_test.go    # Rate limiter burst & refill unit tests
 │   │   ├── server.go            # Manageable dummy HTTP backend servers
 │   │   ├── server_test.go       # Demo server lifecycle tests
 │   │   └── simulation_test.go   # End-to-end K/R failure simulation tests

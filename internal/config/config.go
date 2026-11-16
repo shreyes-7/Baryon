@@ -63,6 +63,19 @@ type Config struct {
 
 	// NoSim disables the traffic simulator on startup (useful for manual curl testing).
 	NoSim bool `json:"no_sim"`
+
+	// BoundedLoadFactor specifies the load capacity multiplier for Consistent Hashing with Bounded Loads (default 1.25, i.e. 125% of average active requests).
+	// Set to 0 to disable bounded loads.
+	BoundedLoadFactor float64 `json:"bounded_load_factor"`
+
+	// MaxActivePerBackend is a static ceiling on concurrent requests per backend (0 = auto based on bounded load factor).
+	MaxActivePerBackend int `json:"max_active_per_backend"`
+
+	// RateLimitPerIP is the maximum requests per second allowed from a single client IP (0 = disabled).
+	RateLimitPerIP int `json:"rate_limit_per_ip"`
+
+	// RateLimitBurst is the maximum burst requests allowed for a client IP.
+	RateLimitBurst int `json:"rate_limit_burst"`
 }
 
 // DefaultConfig returns the default production configuration for BARYON.
@@ -88,6 +101,10 @@ func DefaultConfig() *Config {
 		TrustedProxies:         []string{"127.0.0.1", "::1"},
 		NoTUI:                  false,
 		NoSim:                  false,
+		BoundedLoadFactor:      1.25,
+		MaxActivePerBackend:    0,
+		RateLimitPerIP:         2000,
+		RateLimitBurst:         500,
 	}
 }
 
@@ -161,6 +178,22 @@ func (c *Config) Validate() error {
 
 	if c.TUIRefreshInterval <= 0 {
 		return fmt.Errorf("tui_refresh_interval must be positive, got %v", c.TUIRefreshInterval)
+	}
+
+	if c.BoundedLoadFactor < 0 {
+		return fmt.Errorf("bounded_load_factor cannot be negative, got %f", c.BoundedLoadFactor)
+	}
+
+	if c.MaxActivePerBackend < 0 {
+		return fmt.Errorf("max_active_per_backend cannot be negative, got %d", c.MaxActivePerBackend)
+	}
+
+	if c.RateLimitPerIP < 0 {
+		return fmt.Errorf("rate_limit_per_ip cannot be negative, got %d", c.RateLimitPerIP)
+	}
+
+	if c.RateLimitBurst < 0 {
+		return fmt.Errorf("rate_limit_burst cannot be negative, got %d", c.RateLimitBurst)
 	}
 
 	return nil

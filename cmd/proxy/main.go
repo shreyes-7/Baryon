@@ -36,12 +36,20 @@ func main() {
 	noTUI := flag.Bool("no-tui", false, "Disable interactive terminal dashboard (runs in console/headless mode)")
 	noSim := flag.Bool("no-sim", false, "Disable traffic simulator on startup")
 	logFile := flag.String("log-file", "", "Optional log file destination for background logs")
+	boundedFactor := flag.Float64("bounded-factor", cfg.BoundedLoadFactor, "Bounded load factor (default 1.25, max load = factor * avg load)")
+	maxActive := flag.Int("max-active", cfg.MaxActivePerBackend, "Max active requests per backend (0 for dynamic avg*factor)")
+	rateLimit := flag.Int("rate-limit", cfg.RateLimitPerIP, "Max requests/sec per client IP (0 to disable rate limiting)")
+	rateBurst := flag.Int("rate-burst", cfg.RateLimitBurst, "Token bucket burst capacity per client IP")
 	flag.Parse()
 
 	cfg.ProxyListenAddr = *listenAddr
 	cfg.SimulatorTargetRPS = *targetRPS
 	cfg.NoTUI = *noTUI
 	cfg.NoSim = *noSim
+	cfg.BoundedLoadFactor = *boundedFactor
+	cfg.MaxActivePerBackend = *maxActive
+	cfg.RateLimitPerIP = *rateLimit
+	cfg.RateLimitBurst = *rateBurst
 
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "BARYON Configuration error: %v\n", err)
@@ -123,6 +131,11 @@ func main() {
 
 	// 5. Initialize Reverse Proxy HTTP Server
 	proxyHandler := proxy.NewProxyHandler(ring, eventBus, cfg.TrustedProxies)
+	proxyHandler.SetBoundedLoad(cfg.BoundedLoadFactor, cfg.MaxActivePerBackend)
+	if cfg.RateLimitPerIP > 0 {
+		proxyHandler.SetRateLimiter(cfg.RateLimitPerIP, cfg.RateLimitBurst)
+	}
+
 	proxyServer := &http.Server{
 		Addr:         cfg.ProxyListenAddr,
 		Handler:      proxyHandler,

@@ -27,6 +27,23 @@ func (m *mockRing) GetNode(key string) *Backend {
 	return m.nodes[0]
 }
 
+func (m *mockRing) GetNodeWithBoundedLoad(key string, isOverloaded func(*Backend) bool) *Backend {
+	candidate := m.GetNode(key)
+	if candidate == nil || isOverloaded == nil || !isOverloaded(candidate) {
+		return candidate
+	}
+	for _, n := range m.nodes {
+		if !isOverloaded(n) {
+			return n
+		}
+	}
+	return candidate
+}
+
+func (m *mockRing) GetNodes() []*Backend {
+	return m.nodes
+}
+
 func TestProxyHandlerRouting(t *testing.T) {
 	// Start 3 test upstream servers
 	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -211,4 +228,125 @@ func BenchmarkProxyHandler(b *testing.B) {
 			resp.Body.Close()
 		}
 	})
+}
+
+
+func TestProxyHandlerBoundedLoadHotIPSpillover(t *testing.T) {
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"backend": "backend-1"})
+	}))
+	defer s1.Close()
+
+	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"backend": "backend-2"})
+	}))
+	defer s2.Close()
+
+	u1, _ := url.Parse(s1.URL)
+	u2, _ := url.Parse(s2.URL)
+
+	b1 := NewBackend("backend-1", u1)
+	b2 := NewBackend("backend-2", u2)
+
+	SetupBackendReverseProxy(b1, nil)
+	SetupBackendReverseProxy(b2, nil)
+
+	ring := &mockRing{
+		mapping: map[string]*Backend{
+			"192.168.1.10": b1, // Hot IP maps primarily to b1
+		},
+		nodes: []*Backend{b1, b2},
+	}
+
+	handler := NewProxyHandler(ring, nil, []string{"127.0.0.1"})
+	handler.SetBoundedLoad(1.25, 2) // Cap active requests at 2
+
+	proxyServer := httptest.NewServer(handler)
+	defer proxyServer.Close()
+
+	client := proxyServer.Client()
+
+	// 1. When b1 is not overloaded (active = 0), request goes to b1
+	req, _ := http.NewRequest(http.MethodGet, proxyServer.URL+"/", nil)
+	req.Header.Set("X-Forwarded-For", "192.168.1.10")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	var data map[string]string
+	_ = json.NewDecoder(resp.Body).Decode(&data)
+	resp.Body.Close()
+	if data["backend"] != "backend-1" {
+		t.Errorf("expected backend-1 under normal load, got %s", data["backend"])
+	}
+
+	// 2. Artificially simulate b1 getting overloaded by active in-flight requests
+	b1.IncActive()
+	b1.IncActive()
+	b1.IncActive() // active = 3 >= maxActive (2)
+
+	// Send another request for the same "hot IP"
+	req, _ = http.NewRequest(http.MethodGet, proxyServer.URL+"/", nil)
+	req.Header.Set("X-Forwarded-For", "192.168.1.10")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&data)
+	resp.Body.Close()
+
+	// Because b1 is overloaded, bounded loads must spill the hot IP over to b2!
+	if data["backend"] != "backend-2" {
+		t.Errorf("expected bounded-load spillover to backend-2, got %s", data["backend"])
+	}
+}
+
+func TestProxyHandlerRateLimiting(t *testing.T) {
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"backend": "backend-1"})
+	}))
+	defer s1.Close()
+
+	u1, _ := url.Parse(s1.URL)
+	b1 := NewBackend("backend-1", u1)
+	SetupBackendReverseProxy(b1, nil)
+
+	ring := &mockRing{
+		nodes: []*Backend{b1},
+	}
+
+	handler := NewProxyHandler(ring, nil, []string{"127.0.0.1"})
+	handler.SetRateLimiter(2, 2) // Max 2 req/s, burst 2
+
+	proxyServer := httptest.NewServer(handler)
+	defer proxyServer.Close()
+
+	client := proxyServer.Client()
+
+	// First 2 requests should succeed
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest(http.MethodGet, proxyServer.URL+"/", nil)
+		req.Header.Set("X-Forwarded-For", "10.99.99.99")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request %d failed: %v", i+1, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("request %d expected 200, got %d", i+1, resp.StatusCode)
+		}
+	}
+
+	// 3rd rapid request must be rate limited with HTTP 429
+	req, _ := http.NewRequest(http.MethodGet, proxyServer.URL+"/", nil)
+	req.Header.Set("X-Forwarded-For", "10.99.99.99")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("rate limited request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected 429 Too Many Requests, got %d", resp.StatusCode)
+	}
 }
